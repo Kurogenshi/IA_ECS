@@ -4,6 +4,8 @@ Ce document récapitule les fonctionnalités majeures que j'ai développées (en
 
 L'objectif global du projet : afficher et animer un très grand nombre d'agents humanoïdes (foule) dans une scène Unity, en utilisant l'architecture ECS (Entities) pour profiter du parallélisme et obtenir les meilleures performances possibles.
 
+Le rapport couvre **toutes les phases**, depuis l'initialisation à zéro du projet (Phase 0 : ECS, steering, séparation, rendu en capsules) jusqu'au pipeline d'animation VAT complet avec multi-LOD et culling per-instance (phases 1 à 11).
+
 ---
 
 ## Stack technique du projet
@@ -37,6 +39,111 @@ Pipeline VAT (GPU côté rendu)
 ---
 
 # Phases du développement (chronologique)
+
+---
+
+## Phase 0 — Initialisation du projet ECS et simulation de foule basique
+
+### Demande de l'utilisateur
+
+Mise en place de A à Z d'une simulation de foule en Unity avec architecture ECS (Entities). Le cahier des charges initial :
+- Spawner un grand nombre d'agents dans une zone configurable
+- Les faire se déplacer le long de **chemins (waypoints)** configurables dans la scène
+- **Eviter qu'ils se rentrent dedans** via une force de séparation
+- Avoir des comportements différents (piéton pressé, marcheur normal, stationnaire) avec des paramétrages distincts
+- Rendu **simple à base de capsules** au début, pour valider la mécanique de simulation avant d'ajouter de la complexité graphique
+- Une HUD pour afficher en temps réel le nombre d'agents et le framerate
+
+### Travail effectué
+
+#### 0.1 Architecture des composants ECS
+
+**`Assets/Scripts/Components/AgentComponents.cs`** — définition des composants de simulation, tous des `IComponentData` (struct compactes, cache-friendly) :
+
+- `AgentTag` : composant vide (`IComponentData` sans champs) servant de marqueur pour identifier les entités agent
+- `AgentMovement` : `Speed` (float) + `Velocity` (float3) — la vitesse cible et le vecteur de vélocité courant
+- `AgentTypeData` : enum `AgentBehavior` à 3 valeurs (`HurriedPedestrian`, `Walker`, `Stationary`) pour différencier les comportements
+- `PathFollower` : référence au chemin assigné (`PathEntity`), index du waypoint courant, sens de parcours (avant/arrière), position d'origine (pour les agents stationnaires qui errent autour d'un point)
+- `Waypoint` : `IBufferElementData` listant les positions des points d'un chemin
+- `SpawnerConfig` : paramètres globaux de la simulation, structure unique stockée sur une entité singleton (prefab, count, zone, distribution comportements, vitesses min/max par type, paramètres steering)
+- `SpawnerPathRef` : `IBufferElementData` listant les entités-chemins disponibles, utilisé par le spawner pour assigner un chemin aléatoire à chaque agent
+
+#### 0.2 Authoring (le bridge MonoBehaviour → entités ECS)
+
+L'authoring est le pattern Unity Entities permettant de configurer dans l'Inspector des `MonoBehaviour` classiques qui sont ensuite convertis en composants ECS au moment du baking.
+
+**`Assets/Scripts/Authoring/AgentAuthoring.cs`** : composant placé sur la prefab agent. Sa classe interne `Baker` instancie l'entité avec `TransformUsageFlags.Dynamic` (donne `LocalTransform` + `LocalToWorld`, indispensable pour le mouvement) puis ajoute tous les composants : `AgentTag`, `AgentMovement` (Speed et Velocity initiaux), `AgentTypeData` (Walker par défaut), `PathFollower` (vide, rempli au spawn).
+
+**`Assets/Scripts/Authoring/PathAuthoring.cs`** : composant placé sur un GameObject parent contenant des enfants vides comme waypoints. Le Baker itère sur la hiérarchie d'enfants et remplit le buffer `Waypoint` avec leurs positions monde. Inclut un `OnDrawGizmos()` qui dessine des sphères + lignes entre waypoints pour visualiser le chemin dans la Scene View. Support du mode "manuel" (liste explicite) ou "auto" (tous les enfants directs).
+
+**`Assets/Scripts/Authoring/CrowdSpawnerAuthoring.cs`** : composant racine sur le spawner principal de la scène. Expose dans l'Inspector tous les paramètres exploitables au moment du design :
+- Section *Spawn Settings* : nombre d'agents, centre et taille de la zone, seed aléatoire
+- Section *Behavior Distribution* : pourcentages Hurried / Walker / Stationary (les Stationary remplissent automatiquement le reste)
+- Section *Speeds* : vitesses min/max pour chaque type, rayon de wander pour les stationnaires
+- Section *Steering Tuning* : `SeparationRadius`, `NeighborCellSize`, `WaypointArriveDistance`, `SteeringSmoothing`
+- Section *Paths* : liste des `PathAuthoring` disponibles
+
+Inclut un `OnDrawGizmosSelected()` qui dessine la zone de spawn en wireframe jaune pour aider au placement dans la scène.
+
+#### 0.3 Systèmes ECS de simulation
+
+**`Assets/Scripts/Systems/CrowdSpawnerSystem.cs`** — système **one-shot** (s'auto-désactive après le premier `OnUpdate`).
+- Récupère le singleton `SpawnerConfig` et le buffer `SpawnerPathRef`
+- Boucle sur le nombre d'agents demandé, instancie depuis la prefab via un `EntityCommandBuffer` (toutes les modifications structurelles batchées en un seul playback pour la perf)
+- Pour chaque agent :
+  - Position aléatoire dans la zone
+  - Tire un comportement selon la distribution paramétrée
+  - Tire une vitesse dans la plage min/max du comportement
+  - Si non-stationnaire et qu'il y a des chemins disponibles : assigne un chemin aléatoire et un waypoint de départ aléatoire, choisit un sens de parcours aléatoire
+  - Tire une rotation initiale aléatoire autour de Y
+
+**`Assets/Scripts/Systems/AgentMovementSystem.cs`** — système ultra-léger, Burst-compilé via `IJobEntity`. Tourne après le steering. Pour chaque entité :
+- `transform.Position += movement.Velocity * DeltaTime`
+- Force `Position.y = 0` (évite la dérive en Y)
+- Si la vitesse au carré dépasse un seuil (évite la division par zéro), recalcule l'orientation avec `quaternion.RotateY(atan2(velocity.x, velocity.z))` pour orienter l'agent dans sa direction de marche
+
+**`Assets/Scripts/Systems/AgentSteeringSystem.cs`** — le cœur de la simulation. Deux jobs parallèles `IJobEntity` chaînés via dependencies :
+
+1. **`BuildSpatialHashJob`** : pour chaque agent, calcule sa cellule dans une grille 2D (taille de cellule paramétrée) et l'ajoute à un `NativeParallelMultiHashMap<int, AgentSpatialData>` partagé (struct compacte avec entité, position, flag `IsHurried`). Le hash de cellule combine x et z via des constantes premières (XOR + multiplication). Le `ParallelWriter` permet l'écriture concurrente sans verrou.
+
+2. **`SteeringJob`** : pour chaque agent, calcule la velocity cible :
+   - **Path-following** : si l'agent a un `PathEntity`, lit le buffer `Waypoint` du chemin via un `BufferLookup`. Direction désirée = vecteur normalisé vers le waypoint courant. Si l'agent arrive assez près (< `WaypointArriveDistance`), passe au waypoint suivant en respectant le sens. Boucle modulo le nombre de waypoints.
+   - **Wander stationnaire** : pour les agents `Stationary`, direction désirée = vers `HomePosition` si trop loin, sinon vecteur aléatoire faible pour donner un mouvement de fond.
+   - **Séparation** : itère sur les 9 cellules adjacentes (3×3) dans le spatial hash. Pour chaque voisin distinct, accumule un vecteur `(pos - voisin.pos) / distSq` (force inversement proportionnelle au carré de la distance). Les voisins `IsHurried` ont leur poids multiplié par 1.6 (les pressés bousculent plus).
+   - **Combinaison** : `steer = desired * pathWeight + separation * sepWeight` avec des poids variant selon `AgentBehavior` (Hurried priorise le chemin, Stationary priorise la séparation).
+   - **Smoothing** : la velocity finale est `lerp(currentVelocity, target * speed, saturate(deltaTime * smoothing))` pour des mouvements doux sans à-coups.
+
+Le `NativeParallelMultiHashMap` est alloué en `Allocator.Persistent` sur `OnCreate` et redimensionné à la volée selon le nombre d'agents pour éviter les ré-allocations.
+
+#### 0.4 UI
+
+**`Assets/Scripts/UI/CrowdHUD.cs`** : MonoBehaviour avec `OnGUI()` qui affiche en overlay le nombre d'agents actifs (via une `EntityQuery` sur `AgentTag`) et le FPS approximatif (Time.deltaTime moyennisé). Permet de valider visuellement la stabilité de la simulation et de mesurer l'impact des différentes config.
+
+#### 0.5 Rendu à ce stade
+
+À la fin de cette phase, les agents sont rendus comme de **simples capsules** : la prefab a un `MeshFilter` pointant sur la primitive Capsule d'Unity + un `MeshRenderer` avec le matériau URP/Lit par défaut. Aucune animation, aucun squelette. Les agents glissent au sol comme des bouts de savon — c'est volontairement minimal pour valider que :
+- Le spawning fonctionne (5000 agents apparaissent)
+- Le suivi de chemin fonctionne (les capsules font le tour des waypoints)
+- La séparation empêche les chevauchements (les capsules s'écartent quand elles se croisent)
+- Les comportements distincts sont visibles (Hurried va plus vite, Stationary tourne autour de son point)
+- Le framerate tient (Burst + parallélisme = quelques milliers d'agents OK)
+
+### Raisonnement technique
+
+**Pourquoi l'ECS (Unity Entities / DOTS)** : pour scaler à plusieurs milliers d'agents, l'architecture GameObject + MonoBehaviour ne tient pas (chaque GO a un coût en mémoire et en update). L'ECS apporte :
+- **Données per-agent dans des chunks contigus en mémoire** (cache-friendly, idéal pour les boucles vectorielles SIMD)
+- **Parallélisation native via Burst Jobs** sur tous les cores CPU (le steering parallélise sur les chunks)
+- **Aucune allocation GC** pendant les updates (les NativeContainers utilisent un allocateur custom)
+
+**Spatial hash plutôt que pathfinding global** : la NavMesh ou un A* per-agent serait trop coûteux pour 5000+ agents en temps réel. Le spatial hash + séparation locale donne un comportement de foule fluide en O(N) amorti, suffisant tant que les chemins eux-mêmes sont conçus pour éviter les obstacles statiques.
+
+**Séparation comme seul comportement d'évitement** : pas d'évitement dynamique avancé (RVO, ORCA, etc.). C'est volontairement simple, pour minimiser le coût CPU. Les agents suivent leurs waypoints et la séparation les empêche juste de se télescoper. Pour une simulation de foule de ville (piétons sur trottoirs), c'est suffisant.
+
+**Pondérations différentes par AgentBehavior** : permet une diversité comportementale sans algos différents. Les Hurried ont un poids de chemin plus fort (foncent vers leur destination), les Stationary ont un poids de séparation plus fort (préfèrent reculer plutôt que sortir de leur zone).
+
+### Limites du setup initial (motivant les phases suivantes)
+
+À la fin de cette phase, la simulation est **fonctionnelle mais visuellement médiocre** : juste des capsules qui glissent au sol. Pas d'animation, pas de squelette, pas de personnage. C'est ce qui motive la **Phase 1** : passage à des modèles 3D Mixamo avec animations baked en VAT.
 
 ---
 
