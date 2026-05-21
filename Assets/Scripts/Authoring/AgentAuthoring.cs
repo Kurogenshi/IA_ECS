@@ -30,6 +30,8 @@ namespace Crowd.Authoring
                 AddComponent(entity, new AgentTypeData
                 {
                     Behavior = AgentBehavior.Walker,
+                    BaseBehavior = AgentBehavior.Walker,
+                    BaseSpeed = 1f,
                 });
                 AddComponent(entity, new PathFollower
                 {
@@ -37,6 +39,17 @@ namespace Crowd.Authoring
                     CurrentWaypoint = 0,
                     ReverseDirection = 0,
                     HomePosition = float3.zero,
+                });
+
+                // Phase 4: goal/POI state. Initialized to Idle — the goal system will assign
+                // a target if any POIs exist in the scene; otherwise the agent falls back to
+                // PathFollower behavior.
+                AddComponent(entity, new AgentGoal
+                {
+                    TargetPOI      = Entity.Null,
+                    State          = AgentGoalState.Idle,
+                    Timer          = 0f,
+                    TargetPosition = float3.zero,
                 });
 
                 // Animation

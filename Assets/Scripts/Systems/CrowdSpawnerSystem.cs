@@ -40,9 +40,10 @@ namespace Crowd.Systems
             var ecb = new EntityCommandBuffer(Allocator.Temp);
             var random = new Random(config.RandomSeed);
 
-            float totalDistribution = math.clamp(config.PercentHurried, 0f, 1f) + math.clamp(config.PercentWalker, 0f, 1f);
+            // Phase 3: Stationary is no longer a spawn-time category. Every agent starts as
+            // Walker or HurriedPedestrian; Stationary becomes a runtime state assigned by
+            // AgentGoalSystem when the agent is interacting with a POI.
             float pctHurried = math.clamp(config.PercentHurried, 0f, 1f);
-            float pctWalker = math.clamp(config.PercentWalker, 0f, 1f - pctHurried);
 
             // Grid-based spawn: each agent gets its own cell with mild jitter, guaranteeing
             // a minimum spacing equal to the cell size. This avoids the dense pile-ups that
@@ -71,29 +72,24 @@ namespace Crowd.Systems
                 );
 
                 float r = random.NextFloat();
-                AgentBehavior behavior;
+                AgentBehavior baseBehavior;
                 float speed;
                 if (r < pctHurried)
                 {
-                    behavior = AgentBehavior.HurriedPedestrian;
+                    baseBehavior = AgentBehavior.HurriedPedestrian;
                     speed = random.NextFloat(config.MinSpeedHurried, config.MaxSpeedHurried);
-                }
-                else if (r < pctHurried + pctWalker)
-                {
-                    behavior = AgentBehavior.Walker;
-                    speed = random.NextFloat(config.MinSpeedWalker, config.MaxSpeedWalker);
                 }
                 else
                 {
-                    behavior = AgentBehavior.Stationary;
-                    speed = config.StationaryWanderRadius > 0f ? random.NextFloat(0.05f, 0.25f) : 0f;
+                    baseBehavior = AgentBehavior.Walker;
+                    speed = random.NextFloat(config.MinSpeedWalker, config.MaxSpeedWalker);
                 }
 
                 Entity assignedPath = Entity.Null;
                 int startWaypoint = 0;
                 byte reverse = 0;
 
-                if (pathCount > 0 && behavior != AgentBehavior.Stationary)
+                if (pathCount > 0)
                 {
                     int pIdx = random.NextInt(0, pathCount);
                     assignedPath = pathEntities[pIdx];
@@ -115,7 +111,12 @@ namespace Crowd.Systems
                     Speed = speed,
                     Velocity = float3.zero,
                 });
-                ecb.SetComponent(entity, new AgentTypeData { Behavior = behavior });
+                ecb.SetComponent(entity, new AgentTypeData
+                {
+                    Behavior     = baseBehavior,
+                    BaseBehavior = baseBehavior,
+                    BaseSpeed    = speed,
+                });
                 ecb.SetComponent(entity, new PathFollower
                 {
                     PathEntity = assignedPath,

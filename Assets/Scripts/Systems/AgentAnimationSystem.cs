@@ -54,10 +54,15 @@ namespace Crowd.Systems
                 ref AnimClipProperty clipProp,
                 ref AnimTimeProperty timeProp,
                 in AgentMovement movement,
+                in AgentGoal goal,
                 in VATClipTable table)
             {
                 float speedSq = math.lengthsq(movement.Velocity);
-                AnimClipId desired = speedSq > WalkThresholdSq ? AnimClipId.Walk : AnimClipId.Idle;
+                // Force Idle while interacting with a POI (Phase 4): velocity may still be
+                // decaying from the approach, but we don't want the legs to keep walking on
+                // someone sitting on a bench.
+                bool forceIdle = goal.State == AgentGoalState.Interacting;
+                AnimClipId desired = (!forceIdle && speedSq > WalkThresholdSq) ? AnimClipId.Walk : AnimClipId.Idle;
 
                 if (desired != anim.CurrentClip)
                 {

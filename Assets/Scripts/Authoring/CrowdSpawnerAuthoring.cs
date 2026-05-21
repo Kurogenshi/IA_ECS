@@ -40,6 +40,26 @@ namespace Crowd.Authoring
         public float WaypointArriveDistance = 1.2f;
         public float SteeringSmoothing = 5f;
 
+        [Header("Static Obstacles (Phase 1)")]
+        [Tooltip("Within this distance of any StaticObstacle surface, agents are pushed away. Meters.")]
+        public float ObstacleRepulsionRadius = 2.5f;
+        [Tooltip("Strength of the obstacle repulsion force relative to path-follow / separation.")]
+        public float ObstacleWeight = 4.0f;
+        [Tooltip("Spatial-hash cell size for obstacles. Should roughly match the largest obstacle footprint in the scene.")]
+        public float ObstacleCellSize = 4.0f;
+
+        [Header("Walkable Areas (Phase 2)")]
+        [Tooltip("Spatial-hash cell size for walkable areas. Should roughly match the largest walkable footprint (sidewalk length). Typically larger than ObstacleCellSize.")]
+        public float WalkableCellSize = 8.0f;
+
+        [Header("Local Avoidance / ORCA-lite (Phase 3)")]
+        [Tooltip("How far ahead (seconds) we anticipate neighbor trajectories. 1.5s is a typical sweet spot.")]
+        public float LookAheadTime = 1.5f;
+        [Tooltip("Strength of the anticipation force relative to separation / path-follow.")]
+        public float AvoidanceWeight = 2.0f;
+        [Tooltip("Predicted-collision radius. Two trajectories passing closer than this trigger lateral deviation. Roughly 2× agent radius.")]
+        public float AvoidanceCollisionRadius = 0.7f;
+
         [Header("Performance")]
         [Tooltip("Beyond this distance from the camera, agents are skipped in the vertex shader.")]
         public float MaxRenderDistance = 80f;
@@ -52,6 +72,10 @@ namespace Crowd.Authoring
 
         [Header("Paths")]
         public List<PathAuthoring> Paths = new List<PathAuthoring>();
+
+        [Header("Points of Interest (Phase 4)")]
+        [Tooltip("POIs that agents will pick as destinations. If empty, agents fall back to following the Paths list above.")]
+        public List<POIAuthoring> POIs = new List<POIAuthoring>();
 
         private void OnDrawGizmosSelected()
         {
@@ -95,6 +119,13 @@ namespace Crowd.Authoring
                     MaxShadowDistance = math.max(2f, authoring.MaxShadowDistance),
                     SteeringInterval  = math.max(1, authoring.SteeringInterval),
                     AnimationInterval = math.max(1, authoring.AnimationInterval),
+                    ObstacleRepulsionRadius = math.max(0.1f, authoring.ObstacleRepulsionRadius),
+                    ObstacleWeight          = math.max(0f,   authoring.ObstacleWeight),
+                    ObstacleCellSize        = math.max(0.5f, authoring.ObstacleCellSize),
+                    WalkableCellSize        = math.max(1f,   authoring.WalkableCellSize),
+                    LookAheadTime           = math.max(0.1f, authoring.LookAheadTime),
+                    AvoidanceWeight         = math.max(0f,   authoring.AvoidanceWeight),
+                    AvoidanceCollisionRadius= math.max(0.1f, authoring.AvoidanceCollisionRadius),
                 });
 
                 var buffer = AddBuffer<SpawnerPathRef>(entity);
@@ -106,6 +137,19 @@ namespace Crowd.Authoring
                         buffer.Add(new SpawnerPathRef
                         {
                             PathEntity = GetEntity(p, TransformUsageFlags.None),
+                        });
+                    }
+                }
+
+                var poiBuf = AddBuffer<POIRef>(entity);
+                if (authoring.POIs != null)
+                {
+                    foreach (var poi in authoring.POIs)
+                    {
+                        if (poi == null) continue;
+                        poiBuf.Add(new POIRef
+                        {
+                            POIEntity = GetEntity(poi, TransformUsageFlags.None),
                         });
                     }
                 }
