@@ -109,6 +109,19 @@ namespace Crowd
         /// <summary>If two trajectories would pass within this distance at closest approach,
         /// we treat it as a predicted collision and apply lateral deviation. Roughly 2× agent radius.</summary>
         public float AvoidanceCollisionRadius;
+
+        // ---- Phase 11: Road & crosswalk zones ----
+
+        /// <summary>Spatial-hash cell size for road zones. Match the largest expected road slab footprint.</summary>
+        public float RoadCellSize;
+        /// <summary>Spatial-hash cell size for crosswalks. Typically smaller than RoadCellSize since crosswalks are narrow.</summary>
+        public float CrosswalkCellSize;
+        /// <summary>Within this distance of a road boundary, agents get a repulsion force pushing them back to the sidewalk. Larger than ObstacleRepulsionRadius because roads are big forbidden zones agents must spot from farther.</summary>
+        public float RoadRepulsionRadius;
+        /// <summary>Weighting of the road repulsion force in the steering blend. Usually the same as ObstacleWeight or slightly stronger so it dominates separation drift.</summary>
+        public float RoadWeight;
+        /// <summary>Within this distance of a walkable-area boundary, agents tangent-slide along the boundary instead of crossing it. 0 disables walkable wall-sliding.</summary>
+        public float WalkableSlideRadius;
     }
 
     [InternalBufferCapacity(0)]

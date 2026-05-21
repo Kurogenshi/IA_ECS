@@ -11,8 +11,11 @@ namespace Crowd.Systems
     /// <list type="number">
     /// <item>Static-obstacle pushout (Phase 1): two passes to handle corners where ejecting
     /// from one obstacle pushes the agent into another.</item>
-    /// <item>Walkable-area snap (Phase 2): if the agent ended up outside every walkable area,
-    /// snap it to the closest area's boundary and kill the outward component of velocity.</item>
+    /// <item>Road pushout (Phase 11): if the agent is on a road AND not inside any crosswalk,
+    /// snap it back to the closest walkable area.</item>
+    /// <item>Walkable-area snap (Phase 2): if the agent ended up outside every walkable area
+    /// (and not on a crosswalk), snap it to the closest area's boundary and kill the outward
+    /// component of velocity.</item>
     /// <item>One more obstacle pushout pass: catches the rare case where the walkable snap
     /// nudges the agent back into an obstacle.</item>
     /// </list>
@@ -27,12 +30,16 @@ namespace Crowd.Systems
             state.RequireForUpdate<SpawnerConfig>();
             state.RequireForUpdate<ObstacleSpatialIndex>();
             state.RequireForUpdate<WalkableSpatialIndex>();
+            state.RequireForUpdate<RoadSpatialIndex>();
+            state.RequireForUpdate<CrosswalkSpatialIndex>();
         }
 
         public void OnUpdate(ref SystemState state)
         {
-            var obstacleIndex = SystemAPI.GetSingleton<ObstacleSpatialIndex>();
-            var walkableIndex = SystemAPI.GetSingleton<WalkableSpatialIndex>();
+            var obstacleIndex  = SystemAPI.GetSingleton<ObstacleSpatialIndex>();
+            var walkableIndex  = SystemAPI.GetSingleton<WalkableSpatialIndex>();
+            var roadIndex      = SystemAPI.GetSingleton<RoadSpatialIndex>();
+            var crosswalkIndex = SystemAPI.GetSingleton<CrosswalkSpatialIndex>();
 
             new MovementJob
             {
@@ -44,6 +51,14 @@ namespace Crowd.Systems
                 WalkableCellMap   = walkableIndex.CellToAreaIndex,
                 WalkableCellSize  = walkableIndex.CellSize,
                 EnforceWalkable   = walkableIndex.HasAreas,
+                Roads             = roadIndex.Roads,
+                RoadCellMap       = roadIndex.CellToRoadIndex,
+                RoadCellSize      = roadIndex.CellSize,
+                EnforceRoads      = roadIndex.HasRoads,
+                Crosswalks        = crosswalkIndex.Crosswalks,
+                CrosswalkCellMap  = crosswalkIndex.CellToCrosswalkIndex,
+                CrosswalkCellSize = crosswalkIndex.CellSize,
+                HasCrosswalks     = crosswalkIndex.HasCrosswalks,
             }.ScheduleParallel();
         }
 
@@ -62,6 +77,16 @@ namespace Crowd.Systems
             public float WalkableCellSize;
             public byte EnforceWalkable;
 
+            [ReadOnly] public NativeArray<RoadZone> Roads;
+            [ReadOnly] public NativeParallelMultiHashMap<int, int> RoadCellMap;
+            public float RoadCellSize;
+            public byte EnforceRoads;
+
+            [ReadOnly] public NativeArray<CrosswalkZone> Crosswalks;
+            [ReadOnly] public NativeParallelMultiHashMap<int, int> CrosswalkCellMap;
+            public float CrosswalkCellSize;
+            public byte HasCrosswalks;
+
             private void Execute(ref LocalTransform transform, ref AgentMovement movement)
             {
                 float3 pos = transform.Position + movement.Velocity * DeltaTime;
@@ -73,7 +98,17 @@ namespace Crowd.Systems
                     pos = Pushout(pos, ref movement);
                 }
 
-                if (EnforceWalkable == 1 && WalkableAreas.Length > 0)
+                // Phase 11: if the pedestrian ended up on a road slab AND is not currently
+                // inside a crosswalk, snap them back to the closest walkable area. Crosswalks
+                // (when present) act as "holes" through the road for foot traffic.
+                bool onCrosswalk = HasCrosswalks == 1 && Crosswalks.Length > 0 && IsInsideAnyCrosswalk(pos);
+
+                if (EnforceRoads == 1 && Roads.Length > 0 && !onCrosswalk)
+                {
+                    pos = PushoutFromRoad(pos, ref movement);
+                }
+
+                if (EnforceWalkable == 1 && WalkableAreas.Length > 0 && !onCrosswalk)
                 {
                     pos = ConstrainToWalkable(pos, ref movement);
 
@@ -87,11 +122,17 @@ namespace Crowd.Systems
 
                 transform.Position = pos;
 
+                // Smoothed yaw: snap-rotation reads every micro-oscillation of velocity and
+                // flickers the agent's facing when steering wrestles with constraints. A slerp
+                // toward the target rotation absorbs sub-frame jitter while still tracking
+                // genuine direction changes within ~150ms. Speed gate avoids spinning on the spot
+                // when the agent is essentially stopped (POI interaction, stalled, etc.).
                 float speedSq = math.lengthsq(movement.Velocity);
-                if (speedSq > 0.01f)
+                if (speedSq > 0.04f)
                 {
                     float angle = math.atan2(movement.Velocity.x, movement.Velocity.z);
-                    transform.Rotation = quaternion.RotateY(angle);
+                    quaternion target = quaternion.RotateY(angle);
+                    transform.Rotation = math.slerp(transform.Rotation, target, math.saturate(DeltaTime * 10f));
                 }
             }
 
@@ -224,6 +265,87 @@ namespace Crowd.Systems
                     pos.y = 0f;
                 }
 
+                return pos;
+            }
+
+            /// <summary>
+            /// Returns true if <paramref name="pos"/> lies inside any crosswalk in the spatial index.
+            /// Used to exempt pedestrians from road pushout and walkable snap while crossing.
+            /// </summary>
+            private bool IsInsideAnyCrosswalk(float3 pos)
+            {
+                int2 cell = SpatialHashUtil.Cell(pos, CrosswalkCellSize);
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    for (int dz = -1; dz <= 1; dz++)
+                    {
+                        int hash = SpatialHashUtil.HashCell(new int2(cell.x + dx, cell.y + dz));
+                        if (CrosswalkCellMap.TryGetFirstValue(hash, out int cwIdx, out var it))
+                        {
+                            do
+                            {
+                                var cw = Crosswalks[cwIdx];
+                                ObstacleMath.ClosestPointOnShape(pos, cw.Shape, cw.Center, cw.HalfExtents, cw.RotationY,
+                                    out bool isInside, out _);
+                                if (isInside) return true;
+                            } while (CrosswalkCellMap.TryGetNextValue(out cwIdx, ref it));
+                        }
+                    }
+                }
+                return false;
+            }
+
+            /// <summary>
+            /// If <paramref name="pos"/> is inside any road zone, eject the agent past the nearest
+            /// road boundary by 0.05m. Mirror of <see cref="ConstrainToWalkable"/> in spirit, but
+            /// inverted: here we WANT the agent to leave the shape rather than enter it. Kills
+            /// the inward component of velocity so the agent stops pressing back onto the road.
+            /// </summary>
+            private float3 PushoutFromRoad(float3 pos, ref AgentMovement movement)
+            {
+                int2 cell = SpatialHashUtil.Cell(pos, RoadCellSize);
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    for (int dz = -1; dz <= 1; dz++)
+                    {
+                        int hash = SpatialHashUtil.HashCell(new int2(cell.x + dx, cell.y + dz));
+                        if (RoadCellMap.TryGetFirstValue(hash, out int roadIdx, out var it))
+                        {
+                            do
+                            {
+                                var road = Roads[roadIdx];
+                                float3 closest = ObstacleMath.ClosestPointOnShape(pos, road.Shape, road.Center,
+                                    road.HalfExtents, road.RotationY, out bool inside, out _);
+                                if (inside)
+                                {
+                                    // Agent is inside the road; closest is the nearest boundary
+                                    // point. (closest - pos) points from the agent toward the
+                                    // boundary, which is the OUTWARD direction relative to the road.
+                                    float3 outward = closest - pos;
+                                    outward.y = 0f;
+                                    if (math.lengthsq(outward) < 1e-6f)
+                                    {
+                                        outward = new float3(1f, 0f, 0f);
+                                    }
+                                    else
+                                    {
+                                        outward = math.normalize(outward);
+                                    }
+
+                                    pos = closest + outward * 0.05f;
+                                    pos.y = 0f;
+
+                                    // Kill any velocity component still pulling back into the road.
+                                    float vDotOut = math.dot(movement.Velocity, outward);
+                                    if (vDotOut < 0f)
+                                    {
+                                        movement.Velocity -= outward * vDotOut;
+                                    }
+                                }
+                            } while (RoadCellMap.TryGetNextValue(out roadIdx, ref it));
+                        }
+                    }
+                }
                 return pos;
             }
         }

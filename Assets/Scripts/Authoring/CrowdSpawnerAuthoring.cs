@@ -52,6 +52,18 @@ namespace Crowd.Authoring
         [Tooltip("Spatial-hash cell size for walkable areas. Should roughly match the largest walkable footprint (sidewalk length). Typically larger than ObstacleCellSize.")]
         public float WalkableCellSize = 8.0f;
 
+        [Header("Roads & Crosswalks (Phase 11)")]
+        [Tooltip("Spatial-hash cell size for road zones. Match the largest road-slab footprint in the scene.")]
+        public float RoadCellSize = 12.0f;
+        [Tooltip("Spatial-hash cell size for crosswalks. Crosswalks are narrow, so smaller is fine (3-6m).")]
+        public float CrosswalkCellSize = 4.0f;
+        [Tooltip("Pedestrians within this distance of a road boundary feel a push-back force. Bigger than ObstacleRepulsionRadius because roads are large open zones.")]
+        public float RoadRepulsionRadius = 5.0f;
+        [Tooltip("How strongly road boundaries push pedestrians back. Higher than ObstacleWeight ensures roads beat separation/avoidance drift toward them.")]
+        public float RoadWeight = 5.0f;
+        [Tooltip("How far from a walkable boundary the agent starts tangent-sliding instead of crossing. 0 = walkable wall-sliding disabled.")]
+        public float WalkableSlideRadius = 1.5f;
+
         [Header("Local Avoidance / ORCA-lite (Phase 3)")]
         [Tooltip("How far ahead (seconds) we anticipate neighbor trajectories. 1.5s is a typical sweet spot.")]
         public float LookAheadTime = 1.5f;
@@ -126,6 +138,11 @@ namespace Crowd.Authoring
                     LookAheadTime           = math.max(0.1f, authoring.LookAheadTime),
                     AvoidanceWeight         = math.max(0f,   authoring.AvoidanceWeight),
                     AvoidanceCollisionRadius= math.max(0.1f, authoring.AvoidanceCollisionRadius),
+                    RoadCellSize            = math.max(2f,   authoring.RoadCellSize),
+                    CrosswalkCellSize       = math.max(1f,   authoring.CrosswalkCellSize),
+                    RoadRepulsionRadius     = math.max(0.1f, authoring.RoadRepulsionRadius),
+                    RoadWeight              = math.max(0f,   authoring.RoadWeight),
+                    WalkableSlideRadius     = math.max(0f,   authoring.WalkableSlideRadius),
                 });
 
                 var buffer = AddBuffer<SpawnerPathRef>(entity);

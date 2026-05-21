@@ -32,6 +32,9 @@ namespace Crowd.Systems
         {
             state.RequireForUpdate<SpawnerConfig>();
             state.RequireForUpdate<ObstacleSpatialIndex>();
+            state.RequireForUpdate<RoadSpatialIndex>();
+            state.RequireForUpdate<CrosswalkSpatialIndex>();
+            state.RequireForUpdate<WalkableSpatialIndex>();
             _agentQuery = SystemAPI.QueryBuilder()
                 .WithAll<AgentTag, AgentMovement, AgentTypeData, PathFollower, AgentGoal, LocalTransform>()
                 .Build();
@@ -77,7 +80,10 @@ namespace Crowd.Systems
             // Multiply DeltaTime by the steering interval so the smoothing/lerp behaves as
             // if running at full rate (otherwise velocity would lag behind targets).
             float scaledDt = SystemAPI.Time.DeltaTime * interval;
-            var obstacleIndex = SystemAPI.GetSingleton<ObstacleSpatialIndex>();
+            var obstacleIndex  = SystemAPI.GetSingleton<ObstacleSpatialIndex>();
+            var roadIndex      = SystemAPI.GetSingleton<RoadSpatialIndex>();
+            var crosswalkIndex = SystemAPI.GetSingleton<CrosswalkSpatialIndex>();
+            var walkableIndex  = SystemAPI.GetSingleton<WalkableSpatialIndex>();
 
             var steerJob = new SteeringJob
             {
@@ -98,6 +104,21 @@ namespace Crowd.Systems
                 LookAheadTime = config.LookAheadTime,
                 AvoidanceWeight = config.AvoidanceWeight,
                 AvoidanceCollisionRadiusSq = config.AvoidanceCollisionRadius * config.AvoidanceCollisionRadius,
+                Roads             = roadIndex.Roads,
+                RoadCellMap       = roadIndex.CellToRoadIndex,
+                RoadCellSize      = roadIndex.CellSize,
+                EnforceRoads      = roadIndex.HasRoads,
+                RoadRepulsionRadius = config.RoadRepulsionRadius,
+                RoadWeight        = config.RoadWeight,
+                Crosswalks        = crosswalkIndex.Crosswalks,
+                CrosswalkCellMap  = crosswalkIndex.CellToCrosswalkIndex,
+                CrosswalkCellSize = crosswalkIndex.CellSize,
+                HasCrosswalks     = crosswalkIndex.HasCrosswalks,
+                WalkableAreas     = walkableIndex.Areas,
+                WalkableCellMap   = walkableIndex.CellToAreaIndex,
+                WalkableCellSize  = walkableIndex.CellSize,
+                EnforceWalkable   = walkableIndex.HasAreas,
+                WalkableSlideRadius = config.WalkableSlideRadius,
             };
             state.Dependency = steerJob.ScheduleParallel(_agentQuery, state.Dependency);
         }
@@ -145,6 +166,28 @@ namespace Crowd.Systems
             public float LookAheadTime;
             public float AvoidanceWeight;
             public float AvoidanceCollisionRadiusSq;
+
+            // Phase 11: road tangent projection + active repulsion — keep pedestrians off roads
+            // unless they're on a crosswalk.
+            [ReadOnly] public NativeArray<RoadZone> Roads;
+            [ReadOnly] public NativeParallelMultiHashMap<int, int> RoadCellMap;
+            public float RoadCellSize;
+            public byte EnforceRoads;
+            public float RoadRepulsionRadius;
+            public float RoadWeight;
+
+            [ReadOnly] public NativeArray<CrosswalkZone> Crosswalks;
+            [ReadOnly] public NativeParallelMultiHashMap<int, int> CrosswalkCellMap;
+            public float CrosswalkCellSize;
+            public byte HasCrosswalks;
+
+            // Phase 11 bis: walkable boundary tangent — keep pedestrians from drifting off
+            // sidewalks at the seams between zones / next to non-walkable terrain.
+            [ReadOnly] public NativeArray<WalkableArea> WalkableAreas;
+            [ReadOnly] public NativeParallelMultiHashMap<int, int> WalkableCellMap;
+            public float WalkableCellSize;
+            public byte EnforceWalkable;
+            public float WalkableSlideRadius;
 
             private void Execute(
                 Entity entity,
@@ -384,6 +427,155 @@ namespace Crowd.Systems
                     else desired = float3.zero;
                 }
 
+                // 3b. Roads (Phase 11) — three combined behaviors:
+                //   (a) Active outward repulsion proportional to proximity, so separation /
+                //       avoidance forces from neighbors can't accidentally push agents into the
+                //       road. Lives in `roadForce`, applied in the final blend.
+                //   (b) Tangent projection of `desired` (wall-sliding) when desired points into
+                //       a nearby road from the sidewalk side.
+                //   (c) Hard escape when the agent is already inside a road (overshoot recovery).
+                //       The outward direction here is `closest - pos`, i.e. toward the NEAREST
+                //       boundary, so the agent rebounds to the sidewalk they came from instead
+                //       of crossing the entire road slab.
+                //
+                // All three are skipped while the agent stands inside a crosswalk (crossing is
+                // intentional and a crosswalk is "drilled through" the road for foot traffic).
+                float3 roadForce = float3.zero;
+                bool onCrosswalk = HasCrosswalks == 1 && Crosswalks.Length > 0
+                                 && IsPosInsideAnyCrosswalk(pos);
+
+                if (EnforceRoads == 1 && Roads.Length > 0 && !onCrosswalk)
+                {
+                    float roadSlideRad = math.max(RoadRepulsionRadius, ObstacleRepulsionRadius * 1.5f);
+                    int2 rCell = SpatialHashUtil.Cell(pos, RoadCellSize);
+
+                    for (int dx = -1; dx <= 1; dx++)
+                    {
+                        for (int dz = -1; dz <= 1; dz++)
+                        {
+                            int hash = SpatialHashUtil.HashCell(new int2(rCell.x + dx, rCell.y + dz));
+                            if (RoadCellMap.TryGetFirstValue(hash, out int roadIdx, out var rit))
+                            {
+                                do
+                                {
+                                    var road = Roads[roadIdx];
+                                    float3 closest = ObstacleMath.ClosestPointOnShape(pos, road.Shape, road.Center,
+                                        road.HalfExtents, road.RotationY, out bool inside, out float signedDist);
+
+                                    if (inside)
+                                    {
+                                        // Agent inside the road. ClosestPointOnShape returns the
+                                        // nearest boundary point when inside, so (closest - pos)
+                                        // is the OUTWARD direction toward the nearest exit.
+                                        // Critical: do NOT use (pos - closest) here — that points
+                                        // toward the OPPOSITE boundary and makes the agent cross
+                                        // the entire road instead of rebounding.
+                                        float3 escape = closest - pos;
+                                        escape.y = 0f;
+                                        float escapeLenSq = math.lengthsq(escape);
+                                        float3 nOut = escapeLenSq > 1e-6f
+                                            ? escape * math.rsqrt(escapeLenSq)
+                                            : new float3(1f, 0f, 0f);
+
+                                        // Strong escape push — overrides POI-pull while inside.
+                                        roadForce += nOut;
+                                        // Kill any component of desired that still pulls into the road.
+                                        float dn = math.dot(desired, nOut);
+                                        if (dn < 0f) desired -= nOut * dn;
+                                    }
+                                    else if (signedDist < roadSlideRad)
+                                    {
+                                        // Agent just outside the road. (pos - closest) is OUTWARD here.
+                                        float3 away = pos - closest;
+                                        away.y = 0f;
+                                        float awayLenSq = math.lengthsq(away);
+                                        if (awayLenSq < 1e-6f) continue;
+
+                                        float3 nOut = away * math.rsqrt(awayLenSq);
+
+                                        // (a) Repulsion: quadratic ramp from 0 at slideRad to 1 at the surface.
+                                        float t = 1f - (signedDist / roadSlideRad);
+                                        roadForce += nOut * (t * t);
+
+                                        // (b) Tangent projection of desired.
+                                        float dn = math.dot(desired, nOut);
+                                        if (dn < 0f)
+                                        {
+                                            desired -= nOut * dn * t;
+                                        }
+                                    }
+                                } while (RoadCellMap.TryGetNextValue(out roadIdx, ref rit));
+                            }
+                        }
+                    }
+
+                    roadForce = math.normalizesafe(roadForce);
+
+                    // Re-normalize desired so wall-sliding doesn't shrink the agent's speed.
+                    float dMagSq2 = math.lengthsq(desired);
+                    if (dMagSq2 > 1e-6f) desired = desired * math.rsqrt(dMagSq2);
+                    else desired = float3.zero;
+                }
+
+                // 3c. Walkable-area tangent projection (Phase 11 bis). Keeps agents from drifting
+                // off the sidewalk at spots where the path / POI direction or neighbor pressure
+                // would push them outside the walkable zone (and into either a building, a road,
+                // or empty terrain). Skipped when on a crosswalk (legitimate sidewalk-leave).
+                //
+                // Overlap handling: at intersections, two walkable areas share a seam. We only
+                // tangent-project if a forward probe (pos + outward * (slide + nudge)) lands
+                // outside ALL walkable areas — i.e. the agent would actually leave walkable
+                // territory. Inside an overlap, no projection happens, so seams stay free.
+                if (EnforceWalkable == 1 && WalkableAreas.Length > 0 && WalkableSlideRadius > 0.01f
+                    && !onCrosswalk)
+                {
+                    int2 wCell = SpatialHashUtil.Cell(pos, WalkableCellSize);
+                    for (int dx = -1; dx <= 1; dx++)
+                    {
+                        for (int dz = -1; dz <= 1; dz++)
+                        {
+                            int hash = SpatialHashUtil.HashCell(new int2(wCell.x + dx, wCell.y + dz));
+                            if (WalkableCellMap.TryGetFirstValue(hash, out int aIdx, out var wit))
+                            {
+                                do
+                                {
+                                    var area = WalkableAreas[aIdx];
+                                    float3 closest = ObstacleMath.ClosestPointOnShape(pos, area.Shape, area.Center,
+                                        area.HalfExtents, area.RotationY, out bool insideArea, out float signedDist);
+                                    if (!insideArea) continue;
+
+                                    // Distance to boundary from inside is |signedDist|.
+                                    float distToBoundary = -signedDist;
+                                    if (distToBoundary > WalkableSlideRadius) continue;
+
+                                    // Outward (would-leave) direction: from agent toward boundary.
+                                    float3 outward = closest - pos;
+                                    outward.y = 0f;
+                                    float outLenSq = math.lengthsq(outward);
+                                    if (outLenSq < 1e-6f) continue;
+                                    float3 nOut = outward * math.rsqrt(outLenSq);
+
+                                    float dn = math.dot(desired, nOut);
+                                    if (dn <= 0f) continue; // desired doesn't push outward — fine
+
+                                    // Probe a bit past the boundary; if it's inside another walkable
+                                    // area (overlap/seam), don't fight the desired direction.
+                                    float3 probe = pos + nOut * (distToBoundary + 0.5f);
+                                    if (IsInsideAnyOtherWalkable(probe, aIdx)) continue;
+
+                                    // Tangent-project, weighted by proximity (1 at the boundary, 0 at slideRad).
+                                    float slideWeight = 1f - (distToBoundary / WalkableSlideRadius);
+                                    desired -= nOut * dn * slideWeight;
+                                } while (WalkableCellMap.TryGetNextValue(out aIdx, ref wit));
+                            }
+                        }
+                    }
+
+                    float dMagSq3 = math.lengthsq(desired);
+                    if (dMagSq3 > 1e-6f) desired = desired * math.rsqrt(dMagSq3);
+                    else desired = float3.zero;
+                }
+
                 // 4. Combine
                 float pathWeight = 1.0f;
                 float sepWeight = 1.6f;
@@ -393,7 +585,8 @@ namespace Crowd.Systems
                 float3 steer = desired * pathWeight
                              + separation * sepWeight
                              + avoidance * AvoidanceWeight
-                             + obstacleForce * ObstacleWeight;
+                             + obstacleForce * ObstacleWeight
+                             + roadForce * RoadWeight;
                 float3 targetVelocity = math.normalizesafe(steer) * movement.Speed;
                 targetVelocity.y = 0f;
 
@@ -442,6 +635,64 @@ namespace Crowd.Systems
                 {
                     movement.StuckTimer = math.max(0f, movement.StuckTimer - DeltaTime);
                 }
+            }
+
+            /// <summary>Local helper: true if <paramref name="pos"/> lies inside any crosswalk
+            /// in the spatial index. Mirror of the same function in <see cref="AgentMovementSystem"/>;
+            /// kept inline here to avoid passing the indices through additional structs.</summary>
+            private bool IsPosInsideAnyCrosswalk(float3 pos)
+            {
+                int2 cell = SpatialHashUtil.Cell(pos, CrosswalkCellSize);
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    for (int dz = -1; dz <= 1; dz++)
+                    {
+                        int hash = SpatialHashUtil.HashCell(new int2(cell.x + dx, cell.y + dz));
+                        if (CrosswalkCellMap.TryGetFirstValue(hash, out int cwIdx, out var it))
+                        {
+                            do
+                            {
+                                var cw = Crosswalks[cwIdx];
+                                ObstacleMath.ClosestPointOnShape(pos, cw.Shape, cw.Center, cw.HalfExtents, cw.RotationY,
+                                    out bool isInside, out _);
+                                if (isInside) return true;
+                            } while (CrosswalkCellMap.TryGetNextValue(out cwIdx, ref it));
+                        }
+                    }
+                }
+                return false;
+            }
+
+            /// <summary>True if <paramref name="probe"/> sits inside any walkable area OTHER than
+            /// <paramref name="skipIndex"/>. Used by the walkable wall-sliding logic to recognize
+            /// seam overlaps (two zones meeting at an intersection) and let agents cross freely
+            /// between them. Crosswalks count too — they're a legitimate sidewalk-leave path.</summary>
+            private bool IsInsideAnyOtherWalkable(float3 probe, int skipIndex)
+            {
+                // Crosswalk fast path.
+                if (HasCrosswalks == 1 && Crosswalks.Length > 0 && IsPosInsideAnyCrosswalk(probe))
+                    return true;
+
+                int2 cell = SpatialHashUtil.Cell(probe, WalkableCellSize);
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    for (int dz = -1; dz <= 1; dz++)
+                    {
+                        int hash = SpatialHashUtil.HashCell(new int2(cell.x + dx, cell.y + dz));
+                        if (WalkableCellMap.TryGetFirstValue(hash, out int aIdx, out var it))
+                        {
+                            do
+                            {
+                                if (aIdx == skipIndex) continue;
+                                var area = WalkableAreas[aIdx];
+                                ObstacleMath.ClosestPointOnShape(probe, area.Shape, area.Center, area.HalfExtents, area.RotationY,
+                                    out bool isInside, out _);
+                                if (isInside) return true;
+                            } while (WalkableCellMap.TryGetNextValue(out aIdx, ref it));
+                        }
+                    }
+                }
+                return false;
             }
         }
     }
