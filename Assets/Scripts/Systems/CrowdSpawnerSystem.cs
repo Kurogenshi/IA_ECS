@@ -137,6 +137,17 @@ namespace Crowd.Systems
             ecb.Playback(state.EntityManager);
             ecb.Dispose();
             pathEntities.Dispose();
+
+            // Create the runtime-target singleton so CrowdRuntimeControlSystem can adjust the
+            // live count from the HUD. Initial target matches what we just spawned.
+            var targetEntity = state.EntityManager.CreateEntity();
+            state.EntityManager.SetName(targetEntity, "CrowdRuntimeTarget");
+            state.EntityManager.AddComponentData(targetEntity, new CrowdRuntimeTarget
+            {
+                TargetCount        = config.Count,
+                SpawnBatchPerFrame = 500,
+                NextSeed           = config.RandomSeed * 2654435761u + 1u,
+            });
         }
     }
 }

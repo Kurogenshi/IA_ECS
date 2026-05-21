@@ -129,4 +129,20 @@ namespace Crowd
     {
         public Entity PathEntity;
     }
+
+    /// <summary>
+    /// Live-mutable target count for the crowd. UI / scripts adjust <see cref="TargetCount"/>
+    /// and <see cref="Crowd.Systems.CrowdRuntimeControlSystem"/> reconciles the live count by
+    /// spawning or despawning agents each frame, capped by <see cref="SpawnBatchPerFrame"/> to
+    /// avoid stutter when the delta is large.
+    /// </summary>
+    public struct CrowdRuntimeTarget : IComponentData
+    {
+        public int TargetCount;
+        /// <summary>Maximum agents spawned per frame when target &gt; current. Despawn is unbounded
+        /// because it's cheap (just an ECB DestroyEntity).</summary>
+        public int SpawnBatchPerFrame;
+        /// <summary>Rolling seed for runtime spawn randomness; advanced each frame.</summary>
+        public uint NextSeed;
+    }
 }
